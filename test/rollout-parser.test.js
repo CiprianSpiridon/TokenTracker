@@ -2975,3 +2975,168 @@ test("parseKiroCliIncremental retracts orphan session-file contribution when a c
     await fs.rm(tmp, { recursive: true, force: true });
   }
 });
+
+test("parseKiroCliIncremental retracts migrated session entries even when the source turn had no loop_id (bare message_id key)", async () => {
+  // Bug-2 regression: when a session-file turn has no loop_id, the cursor
+  // key falls back to the bare message_id UUID (no colon). The old
+  // colon-heuristic retraction would skip it. The session_id tag now keeps
+  // the retraction correct.
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "tt-kirocli-no-loop-"));
+  try {
+    const dbPath = path.join(tmp, "data.sqlite3");
+    const queuePath = path.join(tmp, "queue.jsonl");
+    const sessionsDir = path.join(tmp, ".kiro", "sessions", "cli");
+    await fs.mkdir(sessionsDir, { recursive: true });
+    const convId = "11111111-1111-1111-1111-111111111111";
+    const msgId = "22222222-2222-2222-2222-222222222222";
+    const env = { KIRO_CLI_DB_PATH: dbPath, HOME: tmp };
+
+    // Run 1: session-file turn WITHOUT loop_id; requestId falls back to msgId.
+    await fs.writeFile(
+      path.join(sessionsDir, `${convId}.json`),
+      JSON.stringify({
+        session_id: convId,
+        session_state: {
+          rts_model_state: { model_info: { model_id: "claude-sonnet-4.5" } },
+          conversation_metadata: {
+            user_turn_metadatas: [
+              {
+                // no loop_id at all
+                message_ids: [msgId],
+                request_start_timestamp_ms: Date.parse(
+                  "2026-04-20T10:05:00.000Z",
+                ),
+                input_token_count: 100,
+                output_token_count: 200,
+              },
+            ],
+          },
+        },
+      }),
+    );
+    await fs.writeFile(path.join(sessionsDir, `${convId}.jsonl`), "");
+    cp.execFileSync("sqlite3", [
+      dbPath,
+      "CREATE TABLE conversations_v2 (key TEXT, conversation_id TEXT, value TEXT, created_at INTEGER, updated_at INTEGER, PRIMARY KEY (key, conversation_id));",
+    ]);
+
+    const cursors = { version: 1 };
+    const r1 = await rolloutModule.parseKiroCliIncremental({
+      cursors,
+      queuePath,
+      env,
+    });
+    assert.equal(r1.eventsAggregated, 1);
+    // Cursor key is the bare message_id (no colon) but must carry session_id.
+    const cursorEntries = Object.entries(cursors.kiroCli.requests);
+    assert.equal(cursorEntries.length, 1);
+    const [reqId, entry] = cursorEntries[0];
+    assert.equal(reqId.indexOf(":"), -1, "no-loop_id key has no colon");
+    assert.equal(
+      entry.session_id,
+      convId,
+      "cursor entry must carry session_id tag",
+    );
+
+    // Run 2: SQLite now has the conversation. Retraction should fire via
+    // the session_id tag (colon heuristic would have missed it).
+    cp.execFileSync("sqlite3", [
+      dbPath,
+      `INSERT INTO conversations_v2 VALUES ('proj', '${convId}', '${JSON.stringify(
+        {
+          model_info: { model_id: "claude-sonnet-4.5" },
+          user_turn_metadata: {
+            continuation_id: convId,
+            requests: [
+              {
+                request_id: "new-sqlite-req",
+                message_id: msgId,
+                request_start_timestamp_ms: Date.parse(
+                  "2026-04-20T10:05:00.000Z",
+                ),
+                user_prompt_length: 400,
+                response_size: 800,
+                model_id: "claude-sonnet-4.5",
+              },
+            ],
+          },
+        },
+      ).replace(/'/g, "''")}', 1, 2);`,
+    ]);
+
+    await rolloutModule.parseKiroCliIncremental({
+      cursors,
+      queuePath,
+      env,
+    });
+    const keys = Object.keys(cursors.kiroCli.requests);
+    assert.ok(!keys.includes(msgId), "no-loop_id cursor entry retracted");
+    assert.ok(keys.includes("new-sqlite-req"), "SQLite cursor entry present");
+
+    // Queue totals should reflect ONE contribution (100/200), not two.
+    const rows = (await fs.readFile(queuePath, "utf8"))
+      .split("\n")
+      .filter((l) => l.trim())
+      .map((l) => JSON.parse(l));
+    const latest = new Map();
+    for (const row of rows)
+      latest.set(`${row.source}|${row.model}|${row.hour_start}`, row);
+    let totalIn = 0;
+    let totalOut = 0;
+    for (const row of latest.values()) {
+      if (row.source !== "kiro") continue;
+      totalIn += row.input_tokens || 0;
+      totalOut += row.output_tokens || 0;
+    }
+    assert.equal(totalIn, 100);
+    assert.equal(totalOut, 200);
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("parseKiroCliIncremental early-return path applies cap and clamp (Bug-1)", async () => {
+  // Scenario: retraction fires (SQLite has migrated conversation) AND
+  // flatSessions ends up empty (session file is gone) AND flatDb is also
+  // empty-of-usable-requests (e.g., the SQLite row has no requests_json
+  // after retraction). flat.length === 0 → early return. The cap+clamp
+  // MUST still run; previously they were skipped.
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "tt-kirocli-early-"));
+  try {
+    const dbPath = path.join(tmp, "data.sqlite3");
+    const queuePath = path.join(tmp, "queue.jsonl");
+    const env = { KIRO_CLI_DB_PATH: dbPath, HOME: tmp };
+
+    // Pre-seed cursor with 3 entries: one fresh, two over 90 days old.
+    const freshIso = new Date(Date.now() - 5 * 24 * 3600 * 1000).toISOString();
+    const staleIso = new Date(Date.now() - 200 * 24 * 3600 * 1000).toISOString();
+    const cursors = {
+      version: 1,
+      kiroCli: {
+        requests: {
+          fresh: { fingerprint: "f", bucketStart: freshIso.slice(0, 19) + ".000Z", model: "m", input_tokens: 1, output_tokens: 1 },
+          stale1: { fingerprint: "f", bucketStart: staleIso.slice(0, 19) + ".000Z", model: "m", input_tokens: 1, output_tokens: 1 },
+          stale2: { fingerprint: "f", bucketStart: staleIso.slice(0, 19) + ".000Z", model: "m", input_tokens: 1, output_tokens: 1 },
+        },
+      },
+    };
+
+    cp.execFileSync("sqlite3", [
+      dbPath,
+      "CREATE TABLE conversations_v2 (key TEXT, conversation_id TEXT, value TEXT, created_at INTEGER, updated_at INTEGER, PRIMARY KEY (key, conversation_id));",
+    ]);
+    // Empty DB + no session files → flatDb=[], flatSessions=[], flat=0.
+    const r = await rolloutModule.parseKiroCliIncremental({
+      cursors,
+      queuePath,
+      env,
+    });
+    assert.equal(r.recordsProcessed, 0);
+
+    // Cap MUST have run: stale entries dropped, only 'fresh' survives.
+    const keys = Object.keys(cursors.kiroCli.requests).sort();
+    assert.deepEqual(keys, ["fresh"], "cap must drop stale entries on early-return path");
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
