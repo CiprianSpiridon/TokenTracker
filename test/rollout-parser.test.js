@@ -2559,7 +2559,10 @@ test("parseKiroCliIncremental aggregates user_turn_metadatas into half-hour kiro
   try {
     const sessionsDir = path.join(tmp, "sessions", "cli");
     await fs.mkdir(sessionsDir, { recursive: true });
-    const sessionId = "fixture-active-0000-0000-0000-000000000001";
+    // TASK-003: resolver now filters to UUID-shaped filenames only. Use a
+    // valid UUID for the file name; the fixture's own session_id field can
+    // remain its human-readable value.
+    const sessionId = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaa1";
     const activeFixture = await fs.readFile(
       path.join(__dirname, "fixtures", "kiro-cli", "active-source.json"),
       "utf8",
@@ -2632,7 +2635,8 @@ test("parseKiroCliIncremental produces zero buckets for empty user_turn_metadata
   try {
     const sessionsDir = path.join(tmp, "sessions", "cli");
     await fs.mkdir(sessionsDir, { recursive: true });
-    const sessionId = "fixture-empty-0000-0000-0000-000000000002";
+    // TASK-003: UUID-shaped filename required for the resolver to pick it up.
+    const sessionId = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbb2";
     const emptyFixture = await fs.readFile(
       path.join(__dirname, "fixtures", "kiro-cli", "empty-source.json"),
       "utf8",
@@ -2667,25 +2671,57 @@ test("parseKiroCliIncremental produces zero buckets for empty user_turn_metadata
   }
 });
 
-test("resolveKiroCliSessionFiles skips files with an active .lock sibling", async () => {
+test("resolveKiroCliSessionFiles filters to UUID-shaped filenames and includes live .lock-paired sessions", async () => {
+  // Contract change in TASK-003 / be34f26: the resolver now includes files
+  // with a sibling .lock (so active-session turns land on next sync) and
+  // rejects anything whose name isn't a canonical UUID. Backups, scratch
+  // notes, and typos are skipped.
   const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "tt-kirocli-"));
   try {
     const sessionsDir = path.join(tmp, "sessions", "cli");
     await fs.mkdir(sessionsDir, { recursive: true });
-    // Completed session: .json only, no .lock
-    await fs.writeFile(path.join(sessionsDir, "done-0000.json"), "{}");
-    // Live session: .json + .lock
-    await fs.writeFile(path.join(sessionsDir, "live-0000.json"), "{}");
-    await fs.writeFile(path.join(sessionsDir, "live-0000.lock"), '{"pid":1}');
+    const doneUuid = "cccccccc-cccc-cccc-cccc-cccccccccccc";
+    const liveUuid = "dddddddd-dddd-dddd-dddd-dddddddddddd";
+    // Completed session: UUID.json, no .lock
+    await fs.writeFile(path.join(sessionsDir, `${doneUuid}.json`), "{}");
+    // Live session: UUID.json + UUID.lock — MUST be included (new contract)
+    await fs.writeFile(path.join(sessionsDir, `${liveUuid}.json`), "{}");
+    await fs.writeFile(path.join(sessionsDir, `${liveUuid}.lock`), '{"pid":1}');
+    // Non-UUID files that MUST be skipped
+    await fs.writeFile(path.join(sessionsDir, "notes.json"), "{}");
+    await fs.writeFile(path.join(sessionsDir, "foo.bak.json"), "{}");
+    await fs.writeFile(path.join(sessionsDir, "random-name.json"), "{}");
 
-    assert.ok(
-      typeof rolloutModule.resolveKiroCliSessionFiles === "function",
-      "resolveKiroCliSessionFiles must be exported from src/lib/rollout (TASK-002)",
+    assert.ok(typeof rolloutModule.resolveKiroCliSessionFiles === "function");
+
+    const files = rolloutModule.resolveKiroCliSessionFiles({
+      HOME: tmp,
+      KIRO_HOME: tmp,
+    });
+    const names = files.map((p) => path.basename(p)).sort();
+    assert.deepEqual(
+      names,
+      [`${doneUuid}.json`, `${liveUuid}.json`],
+      "only UUID-shaped .json files are returned; .lock-paired UUIDs included",
     );
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
 
-    const files = rolloutModule.resolveKiroCliSessionFiles({ KIRO_HOME: tmp });
-    assert.equal(files.length, 1, "only the unlocked session must be returned");
-    assert.ok(files[0].endsWith("done-0000.json"));
+test("resolveKiroCliSessionFiles honors env.HOME for hermetic CI / test runs", async () => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "tt-kirocli-envhome-"));
+  try {
+    const sessionsDir = path.join(tmp, ".kiro", "sessions", "cli");
+    await fs.mkdir(sessionsDir, { recursive: true });
+    const uuid = "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee";
+    await fs.writeFile(path.join(sessionsDir, `${uuid}.json`), "{}");
+
+    // With env.HOME redirected, we scan the fake home's .kiro — NOT the
+    // real user's ~/.kiro. This keeps CI and tests hermetic.
+    const files = rolloutModule.resolveKiroCliSessionFiles({ HOME: tmp });
+    const names = files.map((p) => path.basename(p));
+    assert.deepEqual(names, [`${uuid}.json`]);
   } finally {
     await fs.rm(tmp, { recursive: true, force: true });
   }
@@ -2710,7 +2746,9 @@ test("parseKiroCliIncremental canonicalizes Bedrock model IDs and re-buckets on 
   try {
     const dbPath = path.join(tmp, "data.sqlite3");
     const queuePath = path.join(tmp, "queue.jsonl");
-    const env = { KIRO_CLI_DB_PATH: dbPath };
+    // HOME + KIRO_HOME point at tmp so resolveKiroCliSessionFiles doesn't
+    // scan the real ~/.kiro/sessions/cli and pollute this test's counts.
+    const env = { KIRO_CLI_DB_PATH: dbPath, HOME: tmp, KIRO_HOME: tmp };
 
     // One conversation with one request: Bedrock ARN-style model id, small
     // prompt/response.
@@ -2813,6 +2851,126 @@ test("parseKiroCliIncremental canonicalizes Bedrock model IDs and re-buckets on 
     // third identical run is again idempotent.
     const r4 = await rolloutModule.parseKiroCliIncremental({ cursors, queuePath, env });
     assert.equal(r4.eventsAggregated, 0);
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("parseKiroCliIncremental retracts orphan session-file contribution when a conversation migrates into SQLite", async () => {
+  // Regression for the HIGH review finding: session-file turns use
+  // `${sessionId}:${loopRand}` as request_id; SQLite uses the raw UUID.
+  // Without the cross-source retraction, a turn that first appears in the
+  // session file and later migrates into SQLite gets counted twice.
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "tt-kirocli-migrate-"));
+  try {
+    const dbPath = path.join(tmp, "data.sqlite3");
+    const queuePath = path.join(tmp, "queue.jsonl");
+    const sessionsDir = path.join(tmp, ".kiro", "sessions", "cli");
+    await fs.mkdir(sessionsDir, { recursive: true });
+    const convId = "ffffffff-ffff-ffff-ffff-ffffffffffff";
+    const env = { KIRO_CLI_DB_PATH: dbPath, HOME: tmp };
+
+    // --- Run 1: only session file exists, no SQLite.
+    await fs.writeFile(
+      path.join(sessionsDir, `${convId}.json`),
+      JSON.stringify({
+        session_id: convId,
+        session_state: {
+          rts_model_state: { model_info: { model_id: "claude-sonnet-4.5" } },
+          conversation_metadata: {
+            user_turn_metadatas: [
+              {
+                loop_id: { rand: 42 },
+                message_ids: ["m1"],
+                request_start_timestamp_ms: Date.parse(
+                  "2026-04-20T10:05:00.000Z",
+                ),
+                input_token_count: 100,
+                output_token_count: 200,
+              },
+            ],
+          },
+        },
+      }),
+    );
+    await fs.writeFile(path.join(sessionsDir, `${convId}.jsonl`), "");
+    cp.execFileSync("sqlite3", [
+      dbPath,
+      "CREATE TABLE conversations_v2 (key TEXT, conversation_id TEXT, value TEXT, created_at INTEGER, updated_at INTEGER, PRIMARY KEY (key, conversation_id));",
+    ]);
+
+    const cursors = { version: 1 };
+    const r1 = await rolloutModule.parseKiroCliIncremental({
+      cursors,
+      queuePath,
+      env,
+    });
+    assert.equal(r1.eventsAggregated, 1, "Run 1: single session-file turn");
+    assert.ok(
+      cursors.kiroCli.requests[`${convId}:42`],
+      "cursor has session-file entry",
+    );
+
+    // --- Run 2: SQLite now contains the migrated conversation AND the
+    //            session file is still on disk.
+    const sqliteRequest = {
+      request_id: "sqlite-req-0001",
+      message_id: "m1",
+      request_start_timestamp_ms: Date.parse("2026-04-20T10:05:00.000Z"),
+      user_prompt_length: 400, // 400 chars / 4 = 100 tokens — same as session-file real tokens
+      response_size: 800,      //   → output tokens 200
+      model_id: "claude-sonnet-4.5",
+    };
+    cp.execFileSync("sqlite3", [
+      dbPath,
+      `INSERT INTO conversations_v2 VALUES ('proj', '${convId}', '${JSON.stringify(
+        {
+          model_info: { model_id: "claude-sonnet-4.5" },
+          user_turn_metadata: { continuation_id: convId, requests: [sqliteRequest] },
+        },
+      ).replace(/'/g, "''")}', 1, 2);`,
+    ]);
+
+    const r2 = await rolloutModule.parseKiroCliIncremental({
+      cursors,
+      queuePath,
+      env,
+    });
+    assert.equal(r2.eventsAggregated, 1, "Run 2: one new SQLite contribution");
+
+    // Cursor: session-file entry retracted, only SQLite entry remains.
+    const reqKeys = Object.keys(cursors.kiroCli.requests);
+    assert.ok(
+      !reqKeys.includes(`${convId}:42`),
+      "session-file cursor entry retracted",
+    );
+    assert.ok(
+      reqKeys.includes("sqlite-req-0001"),
+      "SQLite cursor entry present",
+    );
+
+    // Queue: latest-wins aggregation should show exactly the SQLite
+    // contribution (100 in + 200 out), NOT 200 + 400.
+    const rows = (await fs.readFile(queuePath, "utf8"))
+      .split("\n")
+      .filter((l) => l.trim())
+      .map((l) => JSON.parse(l));
+    const latestByKey = new Map();
+    for (const row of rows) {
+      latestByKey.set(
+        `${row.source}|${row.model}|${row.hour_start}`,
+        row,
+      );
+    }
+    let totalIn = 0;
+    let totalOut = 0;
+    for (const row of latestByKey.values()) {
+      if (row.source !== "kiro") continue;
+      totalIn += row.input_tokens || 0;
+      totalOut += row.output_tokens || 0;
+    }
+    assert.equal(totalIn, 100, "kiro input after migration = single contribution");
+    assert.equal(totalOut, 200, "kiro output after migration = single contribution");
   } finally {
     await fs.rm(tmp, { recursive: true, force: true });
   }

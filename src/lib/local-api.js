@@ -71,6 +71,7 @@ const MODEL_PRICING = {
   //    leaderboard estimated_cost_usd. ──
   "kiro-agent": { input: 3, output: 15, cache_read: 0.3, cache_write: 3.75 },
   "kiro-cli-agent": { input: 3, output: 15, cache_read: 0.3, cache_write: 3.75 },
+  "kiro-auto": { input: 3, output: 15, cache_read: 0.3, cache_write: 3.75 },
   // ── Misc / Free ──
   "glm-4.7-free": { input: 0, output: 0, cache_read: 0 },
   "nemotron-3-super-free": { input: 0, output: 0, cache_read: 0 },
