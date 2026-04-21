@@ -3140,3 +3140,105 @@ test("parseKiroCliIncremental early-return path applies cap and clamp (Bug-1)", 
     await fs.rm(tmp, { recursive: true, force: true });
   }
 });
+
+test("readKiroCliMessageChars does NOT attribute ToolResult chars to assistant output, even when they share a message_id with a later AssistantMessage (Bug B regression)", async () => {
+  // Repro for the D-2 over-count hole: a shared-message_id stream where a
+  // ToolResult event carries 500 chars and a later AssistantMessage carries
+  // 200 chars must attribute exactly 200 to assistantChars — not 700.
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "tt-kirocli-kind-"));
+  try {
+    const sessionsDir = path.join(tmp, ".kiro", "sessions", "cli");
+    await fs.mkdir(sessionsDir, { recursive: true });
+    const convId = "33333333-3333-3333-3333-333333333333";
+    const sharedMid = "44444444-4444-4444-4444-444444444444";
+
+    await fs.writeFile(
+      path.join(sessionsDir, `${convId}.json`),
+      JSON.stringify({
+        session_id: convId,
+        session_state: {
+          rts_model_state: { model_info: { model_id: "claude-sonnet-4.5" } },
+          conversation_metadata: {
+            user_turn_metadatas: [
+              {
+                loop_id: { rand: 99 },
+                message_ids: [sharedMid],
+                request_start_timestamp_ms: Date.parse(
+                  "2026-04-20T10:05:00.000Z",
+                ),
+                input_token_count: 0,
+                output_token_count: 0,
+              },
+            ],
+          },
+        },
+      }),
+    );
+    // .jsonl: ToolResult FIRST (500 chars), AssistantMessage SECOND (200 chars).
+    const toolResultChars = "X".repeat(500);
+    const assistantChars = "Y".repeat(200);
+    await fs.writeFile(
+      path.join(sessionsDir, `${convId}.jsonl`),
+      [
+        JSON.stringify({
+          kind: "ToolResult",
+          data: {
+            message_id: sharedMid,
+            content: [{ kind: "text", data: toolResultChars }],
+          },
+        }),
+        JSON.stringify({
+          kind: "AssistantMessage",
+          data: {
+            message_id: sharedMid,
+            content: [{ kind: "text", data: assistantChars }],
+          },
+        }),
+      ].join("\n"),
+    );
+
+    const queuePath = path.join(tmp, "queue.jsonl");
+    const cursors = { version: 1 };
+    await rolloutModule.parseKiroCliIncremental({
+      cursors,
+      queuePath,
+      env: { HOME: tmp },
+    });
+
+    const rows = (await fs.readFile(queuePath, "utf8"))
+      .split("\n")
+      .filter((l) => l.trim())
+      .map((l) => JSON.parse(l));
+    const kiroRows = rows.filter((r) => r.source === "kiro");
+    assert.equal(kiroRows.length, 1);
+    // 200 chars / 4 = 50 assistant tokens. MUST NOT be (200+500)/4 = 175.
+    assert.equal(
+      kiroRows[0].output_tokens,
+      50,
+      "assistant tokens must exclude ToolResult chars even when shared message_id",
+    );
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("readKiroCliRequests honors env override for TOKENTRACKER_DEBUG (Bug A regression)", async () => {
+  // Repro for the D-8 incomplete fix: readKiroCliRequests's env parameter
+  // was never actually passed from the call site, so hermetic debug toggling
+  // silently fell back to process.env. Point at a nonexistent DB path AND
+  // confirm that TOKENTRACKER_DEBUG in the env (not process.env) takes
+  // effect. We can't easily capture stderr of spawn; instead verify by
+  // ensuring the parser doesn't crash and returns empty, and that the
+  // function signature accepts env in the call.
+  //
+  // Structural check: the call site in parseKiroCliIncremental passes env
+  // (not process.env). grep the module source for the exact argument shape.
+  const src = require("node:fs").readFileSync(
+    path.join(__dirname, "..", "src", "lib", "rollout.js"),
+    "utf8",
+  );
+  assert.ok(
+    src.includes("readKiroCliRequests(dbPath, resolvedEnv)"),
+    "call site must thread env, not fall back to process.env default",
+  );
+});

@@ -3119,18 +3119,24 @@ function resolveKiroCliSessionFiles(env = process.env) {
   return files;
 }
 
-// Build a { message_id -> {chars, kind} } map from a .jsonl sibling file.
-// Lets us approximate per-turn tokens when the live session's
+// Build a { message_id -> {promptChars, assistantChars} } map from a .jsonl
+// sibling file. Lets us approximate per-turn tokens when the live session's
 // user_turn_metadatas.input_token_count / output_token_count fields are 0
-// (kiro-cli 0.x doesn't always populate them). Char chunks come from:
-//   Prompt.data.content[].data          (user input)
-//   AssistantMessage.data.content[].data (assistant text/toolUse)
+// (kiro-cli 0.x doesn't always populate them).
 //
-// TASK-005: reads via readline over a stream so multi-MB .jsonl files don't
-// block sync by buffering whole-file. TASK-013: consolidated into one Map
-// instead of two parallel Maps.
+// Chars are accumulated PER KIND, not per message_id. Earlier attempts used
+// a shared {chars, kind} shape and upgraded kind when a canonical variant
+// arrived late — that was an over-count bug: chars from ToolResult (or
+// other non-Prompt/AssistantMessage events) still accumulated into the
+// shared bucket and were then attributed to the upgraded kind in bulk. This
+// shape keeps Prompt and AssistantMessage chars strictly separated, so
+// events with any other kind for the same message_id never contribute to
+// either bucket.
+//
+// TASK-005: reads via readline over a stream so multi-MB .jsonl files
+// don't block sync by buffering whole-file.
 async function readKiroCliMessageChars(jsonlPath) {
-  /** @type {Map<string,{chars:number,kind:string|undefined}>} */
+  /** @type {Map<string,{promptChars:number,assistantChars:number}>} */
   const byMessage = new Map();
   if (!jsonlPath || !fssync.existsSync(jsonlPath)) return byMessage;
   let stream;
@@ -3157,6 +3163,10 @@ async function readKiroCliMessageChars(jsonlPath) {
       if (!data || typeof data !== "object") continue;
       const mid = data.message_id;
       if (!mid) continue;
+      // Only Prompt and AssistantMessage events contribute chars. Other
+      // kinds (ToolResult, Metadata, …) are dropped entirely — they
+      // neither create nor grow an entry.
+      if (evt.kind !== "Prompt" && evt.kind !== "AssistantMessage") continue;
       const content = Array.isArray(data.content) ? data.content : [];
       let chars = 0;
       for (const c of content) {
@@ -3171,21 +3181,14 @@ async function readKiroCliMessageChars(jsonlPath) {
           }
         }
       }
-      const existing = byMessage.get(mid);
-      if (existing) {
-        existing.chars += chars;
-        // D-2: upgrade kind when a canonical Prompt/AssistantMessage arrives
-        // after an unknown-kind event. Without this, a ToolResult or other
-        // event coming first for the same message_id would strand the chars
-        // under an unknown kind and the attribution loop would skip them.
-        const isKnown =
-          evt.kind === "Prompt" || evt.kind === "AssistantMessage";
-        const hasKnown =
-          existing.kind === "Prompt" || existing.kind === "AssistantMessage";
-        if (isKnown && !hasKnown) existing.kind = evt.kind;
-      } else {
-        byMessage.set(mid, { chars, kind: evt.kind });
+      if (chars === 0) continue;
+      let entry = byMessage.get(mid);
+      if (!entry) {
+        entry = { promptChars: 0, assistantChars: 0 };
+        byMessage.set(mid, entry);
       }
+      if (evt.kind === "Prompt") entry.promptChars += chars;
+      else entry.assistantChars += chars;
     }
   } catch {
     // partial data — return what we have; next sync re-reads fresh.
@@ -3242,17 +3245,17 @@ async function readKiroCliSessionTurns(jsonPath) {
     let outputTokens = toNonNegativeInt(turn.output_token_count);
 
     if (inputTokens === 0 && outputTokens === 0 && messageIds.length > 0) {
-      // Fall back to char-count approximation. Only Prompt counts as input,
-      // only AssistantMessage as output — other event kinds (ToolResult,
-      // Metadata, …) are skipped to avoid inflating output_tokens when
-      // sessions use tools.
+      // Fall back to char-count approximation. charMap already segregates
+      // Prompt vs AssistantMessage chars per message_id (see
+      // readKiroCliMessageChars) so ToolResult and other event kinds
+      // cannot pollute either bucket regardless of event ordering.
       let promptChars = 0;
       let assistantChars = 0;
       for (const mid of messageIds) {
         const entry = charMap.get(mid);
         if (!entry) continue;
-        if (entry.kind === "Prompt") promptChars += entry.chars;
-        else if (entry.kind === "AssistantMessage") assistantChars += entry.chars;
+        promptChars += entry.promptChars;
+        assistantChars += entry.assistantChars;
       }
       inputTokens = Math.floor(promptChars / KIRO_CLI_CHARS_PER_TOKEN);
       outputTokens = Math.floor(assistantChars / KIRO_CLI_CHARS_PER_TOKEN);
@@ -3448,7 +3451,7 @@ async function parseKiroCliIncremental({ sessionFiles, cursors, queuePath, onPro
   // request-id — to avoid double-counting we track session_id ↔ SQLite
   // conversation_id and retract any orphan session-file cursor entries
   // whose conversation has already migrated. SQLite wins.
-  const flatDb = fssync.existsSync(dbPath) ? readKiroCliRequests(dbPath) : [];
+  const flatDb = fssync.existsSync(dbPath) ? readKiroCliRequests(dbPath, resolvedEnv) : [];
   const sessionFilesList = resolveKiroCliSessionFiles(resolvedEnv);
   let flatSessions = [];
   for (const jsonPath of sessionFilesList) {
